@@ -4108,7 +4108,7 @@ async function fetchSubwayRealtimeData(stationName) {
   
   // Seoul Open Data Portal real-time arrival URL (JSON)
   // Endpoints: http://swopenAPI.seoul.go.kr/api/subway/(key)/json/realtimeStationArrival/0/10/(Station)
-  const url = `https://openapi.seoul.go.kr:8088/${appState.apiKey}/json/realtimeStationArrival/0/10/${encodeURIComponent(stationName)}`;
+  const url = `http://swopenapi.seoul.go.kr/api/subway/${appState.apiKey}/json/realtimeStationArrival/0/10/${encodeURIComponent(stationName)}`;
   
   try {
     const response = await fetch(url);
