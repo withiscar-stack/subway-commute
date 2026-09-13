@@ -1,0 +1,8 @@
+﻿{
+  " rewrites\: [
+ {
+ \source\: \/api/subway/:match*\,
+ \destination\: \http://swopenapi.seoul.go.kr/api/subway/:match*\
+ }
+ ]
+}

@@ -4,6 +4,7 @@ let appState = {
   homeDirection: 'up', // 'up' (Wangsimni) or 'down' (Incheon/Gosaek)
   dataMode: 'api', // Default to API mode since user provided a key
   apiKey: '6a4f486753776974383553436e566c',
+  proxyUrl: '',
   expressOnly: false, // Line 9 Express filter
   timers: {},
   simulatedArrivals: {
@@ -4108,10 +4109,17 @@ async function fetchSubwayRealtimeData(stationName) {
   
   // Seoul Open Data Portal real-time arrival URL (JSON)
   // Endpoints: http://swopenAPI.seoul.go.kr/api/subway/(key)/json/realtimeStationArrival/0/10/(Station)
-  const url = `http://swopenapi.seoul.go.kr/api/subway/${appState.apiKey}/json/realtimeStationArrival/0/10/${encodeURIComponent(stationName)}`;
+  const targetUrl = `http://swopenapi.seoul.go.kr/api/subway/${appState.apiKey}/json/realtimeStationArrival/0/10/${encodeURIComponent(stationName)}`;
+  
+  let fetchUrl = targetUrl;
+  if (window.location.hostname.includes('vercel.app')) {
+    fetchUrl = `/api/subway/${appState.apiKey}/json/realtimeStationArrival/0/10/${encodeURIComponent(stationName)}`;
+  } else if (appState.proxyUrl) {
+    fetchUrl = `${appState.proxyUrl}${encodeURIComponent(targetUrl)}`;
+  }
   
   try {
-    const response = await fetch(url);
+    const response = await fetch(fetchUrl);
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -4129,23 +4137,33 @@ async function fetchSubwayRealtimeData(stationName) {
 // Convert real-time API response to unified UI model
 function mapApiDataToUi(apiList, mode, direction = 'up') {
   const results = [];
+  const now = new Date();
   
   if (mode === 'work') {
     // 9호선 종합운동장역 (subwayId: 1009, 중앙보훈병원행은 상행 - updnLine: '상행' or '0')
     const filtered = apiList.filter(item => {
       const isLine9 = item.subwayId === '1009' || item.subwayName === '9호선';
-      const isUp = item.updnLine === '상행' || item.updnLine === '0' || item.trainLineNm.includes('중앙보훈병원');
+      const isUp = item.updnLine === '상행' || item.updnLine === '0' || (item.trainLineNm && item.trainLineNm.includes('중앙보훈병원'));
       return isLine9 && isUp;
     });
     
     filtered.forEach((item, index) => {
-      // Parse arrival seconds/time
-      const secondsLeft = parseInt(item.barvlDt, 10) || 0;
-      const type = item.btrainNo && item.btrainNm === '급행' ? '급행' : '일반';
+      let secondsLeft = parseInt(item.barvlDt, 10) || 0;
+      let statusText = item.arvlMsg2 || '';
       
-      // Try to calculate departure time from scheduled
-      // For API data, if barvlDt is 0, we can use the current time + arrival seconds
-      const now = new Date();
+      if (secondsLeft === 0 && statusText) {
+        if (statusText.includes('도착')) secondsLeft = 15;
+        else if (statusText.includes('진입')) secondsLeft = 45;
+        else if (statusText.includes('전역 출발')) secondsLeft = 120;
+        else if (statusText.includes('전역 도착')) secondsLeft = 180;
+      }
+      
+      // 급행 여부 판별 (btrainSttus 또는 trainLineNm 검사)
+      const isExpress = item.btrainSttus === '급행' || 
+                        (item.trainLineNm && item.trainLineNm.includes('급행')) || 
+                        item.btrainNm === '급행';
+      const type = isExpress ? '급행' : '일반';
+      
       const arrivalTime = new Date(now.getTime() + secondsLeft * 1000);
       const timeStr = `${String(arrivalTime.getHours()).padStart(2, '0')}:${String(arrivalTime.getMinutes()).padStart(2, '0')}`;
       
@@ -4153,35 +4171,60 @@ function mapApiDataToUi(apiList, mode, direction = 'up') {
         id: `api_work_${index}`,
         scheduledTime: timeStr,
         type: type,
-        dest: '중앙보훈병원',
+        dest: item.bstatnNm || '중앙보훈병원',
         secondsLeft: secondsLeft,
-        status: item.arvlMsg2 || `${Math.ceil(secondsLeft / 60)}분 전`
+        status: statusText || (secondsLeft > 0 ? `${Math.ceil(secondsLeft / 60)}분 전` : '도착함'),
+        currentStation: item.arvlMsg3 || ''
       });
     });
   } else {
-    // 수인분당선 모란역 (subwayId: 1075, 왕십리는 상행 - updnLine: '상행' or '0', 인천/고색은 하행 - updnLine: '하행' or '1')
+    // 수인분당선 모란역 (subwayId: 1075)
     const targetUpdn = direction === 'up' ? ['상행', '0'] : ['하행', '1'];
     const filtered = apiList.filter(item => {
       const isBundang = item.subwayId === '1075' || item.subwayName === '수인분당선';
       const isDirMatch = targetUpdn.includes(item.updnLine) || 
-                         (direction === 'up' && item.trainLineNm.includes('왕십리')) ||
-                         (direction === 'down' && (item.trainLineNm.includes('인천') || item.trainLineNm.includes('고색') || item.trainLineNm.includes('수원')));
+                         (direction === 'up' && item.trainLineNm && (item.trainLineNm.includes('왕십리') || item.trainLineNm.includes('청량리') || item.trainLineNm.includes('태평'))) ||
+                         (direction === 'down' && item.trainLineNm && (item.trainLineNm.includes('인천') || item.trainLineNm.includes('고색') || item.trainLineNm.includes('수원') || item.trainLineNm.includes('오이도') || item.trainLineNm.includes('야탑')));
       return isBundang && isDirMatch;
     });
     
     filtered.forEach((item, index) => {
-      const secondsLeft = parseInt(item.barvlDt, 10) || 0;
-      const now = new Date();
+      let secondsLeft = parseInt(item.barvlDt, 10) || 0;
+      let statusText = item.arvlMsg2 || '';
+      
+      // 코레일/수인분당선 barvlDt=0 보정
+      if (secondsLeft === 0 && statusText) {
+        if (statusText.includes('도착')) {
+          secondsLeft = 15;
+        } else if (statusText.includes('진입')) {
+          secondsLeft = 45;
+        } else if (statusText.includes('전역 출발')) {
+          secondsLeft = 120;
+        } else if (statusText.includes('전역 도착')) {
+          secondsLeft = 180;
+        } else {
+          const match = statusText.match(/\[(\d+)\]번째/);
+          if (match) {
+            const stationCount = parseInt(match[1], 10);
+            secondsLeft = stationCount * 150;
+          } else if (statusText.includes('전역')) {
+            secondsLeft = 150;
+          }
+        }
+      }
+      
       const arrivalTime = new Date(now.getTime() + secondsLeft * 1000);
       const timeStr = `${String(arrivalTime.getHours()).padStart(2, '0')}:${String(arrivalTime.getMinutes()).padStart(2, '0')}`;
+      const isExpress = item.btrainSttus === '급행' || (item.trainLineNm && item.trainLineNm.includes('급행'));
       
       results.push({
         id: `api_home_${direction}_${index}`,
         scheduledTime: timeStr,
-        type: '일반',
+        type: isExpress ? '급행' : '일반',
         dest: item.bstatnNm || (direction === 'up' ? '왕십리' : '고색'),
         secondsLeft: secondsLeft,
-        status: item.arvlMsg2 || `${Math.ceil(secondsLeft / 60)}분 전`
+        status: statusText || (secondsLeft > 0 ? `${Math.ceil(secondsLeft / 60)}분 전` : '도착함'),
+        currentStation: item.arvlMsg3 || ''
       });
     });
   }
@@ -4252,9 +4295,15 @@ function renderApp(realtimeData = null) {
         else if (train.secondsLeft < 300) progress = 25;
         
         let prevStation = '봉은사';
-        if (train.status.includes('2역 전')) prevStation = '삼성중앙';
-        if (train.status.includes('3역 전')) prevStation = '선정릉';
-        if (train.status.includes('4역 전')) prevStation = '언주';
+        if (train.currentStation) {
+          prevStation = train.currentStation;
+        } else if (train.status) {
+          const stMatch = train.status.match(/\(([^)]+)\)/);
+          if (stMatch) prevStation = stMatch[1];
+          else if (train.status.includes('2역 전')) prevStation = '삼성중앙';
+          else if (train.status.includes('3역 전')) prevStation = '선정릉';
+          else if (train.status.includes('4역 전')) prevStation = '언주';
+        }
         
         const currStation = '종합운동장';
         
@@ -4385,14 +4434,20 @@ function renderApp(realtimeData = null) {
         else if (train.secondsLeft < 300) progress = 25;
         
         let prevStation = isUp ? '야탑' : '태평';
-        if (isUp) {
-          if (train.status.includes('2역 전')) prevStation = '이매';
-          if (train.status.includes('3역 전')) prevStation = '서현';
-          if (train.status.includes('4역 전')) prevStation = '수내';
-        } else {
-          if (train.status.includes('2역 전')) prevStation = '복정';
-          if (train.status.includes('3역 전')) prevStation = '수서';
-          if (train.status.includes('4역 전')) prevStation = '대모산입구';
+        if (train.currentStation) {
+          prevStation = train.currentStation;
+        } else if (train.status) {
+          const stMatch = train.status.match(/\(([^)]+)\)/);
+          if (stMatch) prevStation = stMatch[1];
+          else if (isUp) {
+            if (train.status.includes('2역 전')) prevStation = '이매';
+            if (train.status.includes('3역 전')) prevStation = '서현';
+            if (train.status.includes('4역 전')) prevStation = '수내';
+          } else {
+            if (train.status.includes('2역 전')) prevStation = '복정';
+            if (train.status.includes('3역 전')) prevStation = '수서';
+            if (train.status.includes('4역 전')) prevStation = '대모산입구';
+          }
         }
         
         const currStation = '모란';
@@ -4661,10 +4716,12 @@ function loadSettings() {
   const savedApiKey = localStorage.getItem('subway_commute_api_key');
   const savedExpressOnly = localStorage.getItem('subway_commute_express_only') === 'true';
   
+  const savedProxyUrl = localStorage.getItem('subway_commute_proxy_url');
   if (savedMode) appState.mode = savedMode;
   if (savedHomeDir) appState.homeDirection = savedHomeDir;
   if (savedDataMode) appState.dataMode = savedDataMode;
   if (savedApiKey) appState.apiKey = savedApiKey;
+  if (savedProxyUrl) appState.proxyUrl = savedProxyUrl;
   appState.expressOnly = savedExpressOnly;
   
   const expressCheckbox = document.getElementById('filter-express-only');
@@ -4673,6 +4730,8 @@ function loadSettings() {
   // Sync to form controls
   document.getElementById('settings-data-mode').value = appState.dataMode;
   document.getElementById('settings-api-key').value = appState.apiKey;
+  const proxyInput = document.getElementById('settings-proxy-url');
+  if (proxyInput) proxyInput.value = appState.proxyUrl || '';
   
   // Toggle apikey input visibility
   const apikeyGroup = document.getElementById('apikey-group');
@@ -4687,12 +4746,16 @@ function loadSettings() {
 function saveSettings() {
   const dataMode = document.getElementById('settings-data-mode').value;
   const apiKey = document.getElementById('settings-api-key').value.trim();
+  const proxyInput = document.getElementById('settings-proxy-url');
+  const proxyUrl = proxyInput ? proxyInput.value.trim() : '';
   
   appState.dataMode = dataMode;
   appState.apiKey = apiKey;
+  appState.proxyUrl = proxyUrl;
   
   localStorage.setItem('subway_commute_data_mode', dataMode);
   localStorage.setItem('subway_commute_api_key', apiKey);
+  localStorage.setItem('subway_commute_proxy_url', proxyUrl);
   
   // Update view and trigger reload
   const apikeyGroup = document.getElementById('apikey-group');
